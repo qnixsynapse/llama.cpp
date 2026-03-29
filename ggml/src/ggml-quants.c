@@ -2336,6 +2336,291 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ====================== TurboQuant (https://arxiv.org/abs/2504.19874)
+
+// Lloyd-Max optimal centroids for N(0,1) — Hadamard rotation
+// gaussianizes coordinates via concentration of measure (Lemma 1).
+// 2-bit (4 levels)
+static const float tvq3_centroids[4] = {-1.5104f, -0.4528f, 0.4528f, 1.5104f};
+// 3-bit (8 levels)
+static const float tvq4_centroids[8] = {
+    -2.1519f, -1.3440f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3440f,  2.1519f
+};
+
+// In-place unnormalized Walsh-Hadamard transform. n must be a power of 2.
+static void tvq_hadamard(float * x, int n) {
+    for (int len = 1; len < n; len <<= 1) {
+        for (int i = 0; i < n; i += 2 * len) {
+            for (int j = 0; j < len; j++) {
+                float a = x[i + j];
+                float b = x[i + j + len];
+                x[i + j]       = a + b;
+                x[i + j + len] = a - b;
+            }
+        }
+    }
+}
+
+// Deterministic ±1 sign vector from seed (simple splitmix64 hash)
+static void tvq_gen_signs(int8_t * signs, int n, uint64_t seed) {
+    for (int i = 0; i < n; i++) {
+        seed += 0x9e3779b97f4a7c15ULL;
+        uint64_t z = seed;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        z ^= (z >> 31);
+        signs[i] = (z & 1) ? 1 : -1;
+    }
+}
+
+// Forward rotation: buf = H · diag(signs) · x / sqrt(n)
+static void tvq_rotate_fwd(const float * x, float * buf, const int8_t * signs, int n) {
+    for (int i = 0; i < n; i++) {
+        buf[i] = x[i] * signs[i];
+    }
+    tvq_hadamard(buf, n);
+    const float s = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) {
+        buf[i] *= s;
+    }
+}
+
+// Inverse rotation: out = diag(signs) · H · x / sqrt(n)
+static void tvq_rotate_inv(float * x, float * buf, const int8_t * signs, int n) {
+    memcpy(buf, x, n * sizeof(float));
+    tvq_hadamard(buf, n);
+    const float s = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) {
+        x[i] = buf[i] * s * signs[i];
+    }
+}
+
+// QJL forward: project residual with a second Hadamard, return sign bits.
+// Stores ||r||_2 into *r_norm_out.
+static void tvq_qjl_forward(const float * residual, uint8_t * qr, float * r_norm_out,
+                            const int8_t * signs, int n) {
+    float buf[QK_TVQ];
+    float norm2 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        norm2 += residual[i] * residual[i];
+    }
+    *r_norm_out = sqrtf(norm2);
+
+    tvq_rotate_fwd(residual, buf, signs, n);
+
+    memset(qr, 0, n / 8);
+    for (int i = 0; i < n; i++) {
+        if (buf[i] > 0.0f) {
+            qr[i / 8] |= (1 << (i % 8));
+        }
+    }
+}
+
+// QJL inverse: reconstruct residual approximation from sign bits.
+// result = sqrt(π/2) · r_norm / n · diag(signs_qjl) · H · z
+static void tvq_qjl_inverse(const uint8_t * qr, float r_norm, float * out,
+                            const int8_t * signs, int n) {
+    float buf[QK_TVQ];
+    for (int i = 0; i < n; i++) {
+        int s = (qr[i / 8] >> (i % 8)) & 1;
+        buf[i] = (2 * s - 1);
+    }
+    tvq_hadamard(buf, n);
+
+    const float scale = sqrtf((float)M_PI / 2.0f) * r_norm / (float)n;
+    for (int i = 0; i < n; i++) {
+        out[i] = buf[i] * scale * signs[i];
+    }
+}
+
+#define TVQ_ROTATION_SEED  0x5A42ULL
+#define TVQ_QJL_SEED       0x7E89ULL
+
+void quantize_row_tvq3_0_ref(const float * GGML_RESTRICT x, block_tvq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TVQ == 0);
+    const int64_t nb = k / QK_TVQ;
+
+    int8_t rot_signs[QK_TVQ];
+    int8_t qjl_signs[QK_TVQ];
+    tvq_gen_signs(rot_signs, QK_TVQ, TVQ_ROTATION_SEED);
+    tvq_gen_signs(qjl_signs, QK_TVQ, TVQ_QJL_SEED);
+
+    for (int64_t i = 0; i < nb; i++) {
+        float rotated[QK_TVQ];
+        tvq_rotate_fwd(x, rotated, rot_signs, QK_TVQ);
+
+        float sum2 = 0.0f;
+        for (int j = 0; j < QK_TVQ; j++) {
+            sum2 += rotated[j] * rotated[j];
+        }
+
+        const float d  = sqrtf(sum2 / QK_TVQ);
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        memset(y[i].qr, 0, sizeof(y[i].qr));
+
+        float residual[QK_TVQ];
+        for (int j = 0; j < QK_TVQ; j++) {
+            const float xn = rotated[j] * id;
+
+            int best = 0;
+            float best_dist = fabsf(xn - tvq3_centroids[0]);
+            for (int c = 1; c < 4; c++) {
+                float dist = fabsf(xn - tvq3_centroids[c]);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best = c;
+                }
+            }
+
+            y[i].qs[j / 4] |= (best & 3) << (2 * (j % 4));
+            residual[j] = xn - tvq3_centroids[best];
+        }
+
+        float r_norm;
+        tvq_qjl_forward(residual, y[i].qr, &r_norm, qjl_signs, QK_TVQ);
+        y[i].r_norm = GGML_FP32_TO_FP16(r_norm);
+
+        x += QK_TVQ;
+    }
+}
+
+void quantize_row_tvq4_0_ref(const float * GGML_RESTRICT x, block_tvq4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TVQ == 0);
+    const int64_t nb = k / QK_TVQ;
+
+    int8_t rot_signs[QK_TVQ];
+    int8_t qjl_signs[QK_TVQ];
+    tvq_gen_signs(rot_signs, QK_TVQ, TVQ_ROTATION_SEED);
+    tvq_gen_signs(qjl_signs, QK_TVQ, TVQ_QJL_SEED);
+
+    for (int64_t i = 0; i < nb; i++) {
+        float rotated[QK_TVQ];
+        tvq_rotate_fwd(x, rotated, rot_signs, QK_TVQ);
+
+        float sum2 = 0.0f;
+        for (int j = 0; j < QK_TVQ; j++) {
+            sum2 += rotated[j] * rotated[j];
+        }
+
+        const float d  = sqrtf(sum2 / QK_TVQ);
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        memset(y[i].qh, 0, sizeof(y[i].qh));
+        memset(y[i].qr, 0, sizeof(y[i].qr));
+
+        float residual[QK_TVQ];
+        for (int j = 0; j < QK_TVQ; j++) {
+            const float xn = rotated[j] * id;
+
+            int best = 0;
+            float best_dist = fabsf(xn - tvq4_centroids[0]);
+            for (int c = 1; c < 8; c++) {
+                float dist = fabsf(xn - tvq4_centroids[c]);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best = c;
+                }
+            }
+
+            y[i].qs[j / 4] |= (best & 3) << (2 * (j % 4));
+            y[i].qh[j / 8] |= ((best >> 2) & 1) << (j % 8);
+            residual[j] = xn - tvq4_centroids[best];
+        }
+
+        float r_norm;
+        tvq_qjl_forward(residual, y[i].qr, &r_norm, qjl_signs, QK_TVQ);
+        y[i].r_norm = GGML_FP32_TO_FP16(r_norm);
+
+        x += QK_TVQ;
+    }
+}
+
+size_t quantize_tvq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TVQ3_0, n_per_row);
+    quantize_row_tvq3_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_tvq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TVQ4_0, n_per_row);
+    quantize_row_tvq4_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
+void dequantize_row_tvq3_0(const block_tvq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TVQ == 0);
+    const int64_t nb = k / QK_TVQ;
+
+    int8_t rot_signs[QK_TVQ], qjl_signs[QK_TVQ];
+    tvq_gen_signs(rot_signs, QK_TVQ, TVQ_ROTATION_SEED);
+    tvq_gen_signs(qjl_signs, QK_TVQ, TVQ_QJL_SEED);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d      = GGML_FP16_TO_FP32(x[i].d);
+        const float r_norm = GGML_FP16_TO_FP32(x[i].r_norm);
+
+        // MSE dequant in rotated space
+        float buf[QK_TVQ];
+        for (int j = 0; j < QK_TVQ; j++) {
+            int qi = (x[i].qs[j / 4] >> (2 * (j % 4))) & 3;
+            buf[j] = tvq3_centroids[qi];
+        }
+
+        // QJL residual correction
+        float qjl_out[QK_TVQ];
+        tvq_qjl_inverse(x[i].qr, r_norm, qjl_out, qjl_signs, QK_TVQ);
+        for (int j = 0; j < QK_TVQ; j++) {
+            buf[j] = (buf[j] + qjl_out[j]) * d;
+        }
+
+        // Inverse rotation
+        float tmp[QK_TVQ];
+        tvq_rotate_inv(buf, tmp, rot_signs, QK_TVQ);
+        memcpy(y, buf, QK_TVQ * sizeof(float));
+        y += QK_TVQ;
+    }
+}
+
+void dequantize_row_tvq4_0(const block_tvq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TVQ == 0);
+    const int64_t nb = k / QK_TVQ;
+
+    int8_t rot_signs[QK_TVQ], qjl_signs[QK_TVQ];
+    tvq_gen_signs(rot_signs, QK_TVQ, TVQ_ROTATION_SEED);
+    tvq_gen_signs(qjl_signs, QK_TVQ, TVQ_QJL_SEED);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d      = GGML_FP16_TO_FP32(x[i].d);
+        const float r_norm = GGML_FP16_TO_FP32(x[i].r_norm);
+
+        float buf[QK_TVQ];
+        for (int j = 0; j < QK_TVQ; j++) {
+            int lo = (x[i].qs[j / 4] >> (2 * (j % 4))) & 3;
+            int hi = (x[i].qh[j / 8] >> (j % 8)) & 1;
+            buf[j] = tvq4_centroids[lo | (hi << 2)];
+        }
+
+        float qjl_out[QK_TVQ];
+        tvq_qjl_inverse(x[i].qr, r_norm, qjl_out, qjl_signs, QK_TVQ);
+        for (int j = 0; j < QK_TVQ; j++) {
+            buf[j] = (buf[j] + qjl_out[j]) * d;
+        }
+
+        float tmp[QK_TVQ];
+        tvq_rotate_inv(buf, tmp, rot_signs, QK_TVQ);
+        memcpy(y, buf, QK_TVQ * sizeof(float));
+        y += QK_TVQ;
+    }
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -5352,6 +5637,22 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TVQ3_0:
+            {
+                const block_tvq3_0 * q = (const block_tvq3_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d, i))      { return false; }
+                    if (!validate_fp16(q[i].r_norm, i))  { return false; }
+                }
+            } break;
+        case GGML_TYPE_TVQ4_0:
+            {
+                const block_tvq4_0 * q = (const block_tvq4_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d, i))      { return false; }
+                    if (!validate_fp16(q[i].r_norm, i))  { return false; }
+                }
             } break;
         case GGML_TYPE_IQ1_S:
             {

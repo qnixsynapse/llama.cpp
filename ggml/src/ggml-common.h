@@ -438,7 +438,32 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
-#endif // GGML_COMMON_DECL
+// TurboQuant (refer: https://arxiv.org/abs/2504.19874)
+// Hadamard rotation + Lloyd-Max scalar quantization + 1-bit QJL residual correction
+// Block size 64 to fit KV cache head dimensions (64, 128)
+#define QK_TVQ 64
+//
+// TVQ3_0 (3.5 bpw = 16 + 8 + 2 + 2 = 28 bytes / 64 elements)
+typedef struct {
+    ggml_half d;
+    ggml_half r_norm;
+    uint8_t qs[QK_TVQ/4];
+    uint8_t qr[QK_TVQ/8];
+} block_tvq3_0;
+static_assert(sizeof(block_tvq3_0) == 2 * sizeof(ggml_half) + QK_TVQ/4 + QK_TVQ/8, "wrong tvq3_0 block size/padding");
+
+// TVQ4_0 (4.5 bpw = 16 + 8 + 8 + 2 + 2 = 36 bytes / 64 elements)
+typedef struct {
+    ggml_half d;
+    ggml_half r_norm;
+    uint8_t   qs[QK_TVQ / 4];
+    uint8_t   qh[QK_TVQ / 8];
+    uint8_t   qr[QK_TVQ / 8];
+} block_tvq4_0;
+static_assert(sizeof(block_tvq4_0) == 2 * sizeof(ggml_half) + QK_TVQ / 4 + QK_TVQ / 8 + QK_TVQ / 8,
+              "wrong tvq4_0 block size/padding");
+
+#    endif  // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
 ////////////////////////////////////////////////////////////////////////////////
